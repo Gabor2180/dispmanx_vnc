@@ -39,3 +39,11 @@ sudo ./dispmanx_vnc rfbport 5901
 
 ### Possible Errors
 If you see the message, "open /dev/uinput returned -1." it is because you are trying to run dispmanx without being root.
+
+### Performance
+The VNC server has been optimized for better performance:
+* Target frame rate of 30 FPS
+* Fast frame comparison using memcmp for row-level change detection
+* Early exit when no screen changes are detected
+* Optimized pixel format conversion
+* Compiler optimizations enabled (-O3, loop unrolling, vectorization)
