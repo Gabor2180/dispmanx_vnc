@@ -1,0 +1,5 @@
+# Build artifacts
+dispmanx_vncserver
+
+# CodeQL analysis artifacts
+_codeql_detected_source_root
