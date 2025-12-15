@@ -28,8 +28,8 @@
 #define ALIGN_UP(x,y)  ((x + (y)-1) & ~((y)-1))
 #endif
 
-/* 15 frames per second (if we can) */
-#define PICTURE_TIMEOUT (1.0/15.0)
+/* Target frame rate for VNC updates */
+#define TARGET_FPS 30
 
 DISPMANX_DISPLAY_HANDLE_T   display;
 DISPMANX_RESOURCE_HANDLE_T  resource;
@@ -61,26 +61,47 @@ int last_x;
 int last_y;
 bool down_keys[KEY_CNT];
 
+/* Frame interval in microseconds for target fps */
+#define FRAME_INTERVAL_USEC (1000000/TARGET_FPS)
+
 /*
 * throttle camera updates
+* Optimized to use integer arithmetic instead of floating point
 */
 int TimeToTakePicture() {
-	static struct timeval now={0,0}, then={0,0};
-	double elapsed, dnow, dthen;
+	static struct timeval then = {0, 0};
+	struct timeval now;
+	long elapsed_usec;
 
-	gettimeofday(&now,NULL);
+	gettimeofday(&now, NULL);
 
-	dnow  = now.tv_sec  + (now.tv_usec /1000000.0);
-	dthen = then.tv_sec + (then.tv_usec/1000000.0);
-	elapsed = dnow - dthen;
+	/* Calculate elapsed time in microseconds using integer math */
+	elapsed_usec = (now.tv_sec - then.tv_sec) * 1000000L + (now.tv_usec - then.tv_usec);
 
-	if (elapsed > PICTURE_TIMEOUT)
-		memcpy((char *)&then, (char *)&now, sizeof(struct timeval));
-	return elapsed > PICTURE_TIMEOUT;
+	if (elapsed_usec >= FRAME_INTERVAL_USEC) {
+		then = now;
+		return 1;
+	}
+	return 0;
+}
+
+/*
+* Optimized pixel format conversion from RGB565 to BGR555
+* Uses bit manipulation to swap R and B channels efficiently
+*/
+static inline unsigned short rgb565_to_bgr555(unsigned short pixel) {
+	unsigned short R5 = (pixel >> 11);
+	unsigned short G5 = ((pixel >> 6) & 0x1f);
+	unsigned short B5 = pixel & 0x1f;
+	return (B5 << 10) | (G5 << 5) | R5;
 }
 
 /*
 * simulate grabbing a picture from some device
+* Optimized version with:
+* - memcmp for fast row comparison
+* - Early exit when no changes detected
+* - Reduced redundant calculations
 */
 int TakePicture(unsigned char *buffer)
 {
@@ -89,7 +110,6 @@ int TakePicture(unsigned char *buffer)
 	int i,j;
 	int offset;
 	struct timeval now;
-	int found;
 
 	VC_IMAGE_TRANSFORM_T	transform = 0;
 	VC_RECT_T			rect;
@@ -99,110 +119,140 @@ int TakePicture(unsigned char *buffer)
 	vc_dispmanx_rect_set(&rect, 0, 0, info.width, info.height);
 	vc_dispmanx_resource_read_data(resource, &rect, image, pitch); 
 
-	unsigned short *image_p = (unsigned short *)image;
-	unsigned short *buffer_p = (unsigned short *)buffer;
+	unsigned short * restrict image_p = (unsigned short *)image;
+	unsigned short * restrict buffer_p = (unsigned short *)buffer;
+	unsigned short * restrict back_image_p = (unsigned short *)back_image;
 
+	const int width = info.width;
+	const int height = info.height;
+	const int row_bytes = width * BPP;
 
-	// find y0, y1
-	found = 0;
-	unsigned short *back_image_p = (unsigned short *)back_image;
-	for (i=0; i<info.height && !found; i++)
-	{
-		for (j = 0; j<info.width; j++) {
-			if (back_image_p[i*padded_width + j] != image_p[i*padded_width + j])
-			{
-				r_y0 = i;
-				found  = 1;		
-				break;
-			}
+	/* Quick check: if entire frame is identical, skip processing */
+	int has_changes = 0;
+
+	/* Find first changed row (y0) using memcmp for speed */
+	r_y0 = height;  /* Initialize to no change */
+	for (i = 0; i < height; i++) {
+		if (memcmp(&back_image_p[i * padded_width], &image_p[i * padded_width], row_bytes) != 0) {
+			r_y0 = i;
+			has_changes = 1;
+			break;
 		}
 	}
 
-	found = 0;
-	for (i=info.height-1; i>=r_y0 && !found; i--)
-	{
-		for (j = 0; j<info.width; j++) {
-			if (back_image_p[i*padded_width + j] != image_p[i*padded_width + j])
-			{
-				r_y1 = i+1;
-				found  = 1;		
-				break;
-			}
+	/* If no changes, skip all processing */
+	if (!has_changes) {
+		r_x0 = r_y0 = r_x1 = r_y1 = 0;
+		ur_x0 = ur_y0 = ur_x1 = ur_y1 = 0;
+		/* Still need to swap buffers */
+		void *tmp_image = back_image;
+		back_image = image;
+		image = tmp_image;
+		return 1;
+	}
+
+	/* Find last changed row (y1) using memcmp */
+	r_y1 = r_y0 + 1;  /* At least one row changed */
+	for (i = height - 1; i > r_y0; i--) {
+		if (memcmp(&back_image_p[i * padded_width], &image_p[i * padded_width], row_bytes) != 0) {
+			r_y1 = i + 1;
+			break;
 		}
 	}
 
-	found = 0;
-	for (i=0; i<info.width && !found; i++)
-	{
-		for (j = r_y0; j< r_y1; j++) {
-			if (back_image_p[j*padded_width + i] != image_p[j*padded_width + i])
-			{
+	/* Find x0 (leftmost changed column in changed rows) */
+	r_x0 = width;
+	for (j = r_y0; j < r_y1; j++) {
+		int row_offset = j * padded_width;
+		for (i = 0; i < r_x0; i++) {
+			if (back_image_p[row_offset + i] != image_p[row_offset + i]) {
 				r_x0 = i;
-				found  = 1;		
 				break;
+			}
+		}
+		if (r_x0 == 0) break;  /* Can't go further left */
+	}
+
+	/* Find x1 (rightmost changed column in changed rows) */
+	r_x1 = r_x0 + 1;
+	for (j = r_y0; j < r_y1; j++) {
+		int row_offset = j * padded_width;
+		for (i = width - 1; i >= r_x1; i--) {
+			if (back_image_p[row_offset + i] != image_p[row_offset + i]) {
+				if (i + 1 > r_x1) r_x1 = i + 1;
+				break;
+			}
+		}
+		if (r_x1 == width) break;  /* Can't go further right */
+	}
+
+	/* Convert and copy pixels for the changed region */
+	const int transform_type = info.transform;
+	
+	if (transform_type == 0 || transform_type == 1) {
+		/* No rotation or simple case - process row by row */
+		for (j = r_y0; j < r_y1; ++j) {
+			int row_offset = j * padded_width;
+			for (i = r_x0; i < r_x1; ++i) {
+				buffer_p[row_offset + i] = rgb565_to_bgr555(image_p[row_offset + i]);
+			}
+		}
+	} else if (transform_type == 2) {
+		/* 180 degree rotation */
+		for (j = r_y0; j < r_y1; ++j) {
+			int src_row_offset = j * padded_width;
+			int dst_row_base = (-j + height - 1) * padded_width;
+			for (i = r_x0; i < r_x1; ++i) {
+				offset = dst_row_base + (-i + padded_width - 1);
+				buffer_p[offset] = rgb565_to_bgr555(image_p[src_row_offset + i]);
+			}
+		}
+	} else if (transform_type == 3) {
+		/* 90 degree rotation */
+		for (j = r_y0; j < r_y1; ++j) {
+			int src_row_offset = j * padded_width;
+			int dst_y_offset = height - 1 - j;
+			for (i = r_x0; i < r_x1; ++i) {
+				offset = i * height + dst_y_offset;
+				buffer_p[offset] = rgb565_to_bgr555(image_p[src_row_offset + i]);
+			}
+		}
+	} else {
+		/* Default fallback for other transforms */
+		for (j = r_y0; j < r_y1; ++j) {
+			int row_offset = j * padded_width;
+			for (i = r_x0; i < r_x1; ++i) {
+				buffer_p[row_offset + i] = rgb565_to_bgr555(image_p[row_offset + i]);
 			}
 		}
 	}
 
-	found = 0;
-	for (i=info.width-1; i>=r_x0 && !found; i--)
-	{
-		for (j = r_y0; j< r_y1; j++) {
-			if (back_image_p[j*padded_width + i] != image_p[j*padded_width + i])
-			{
-				r_x1 = i+1;
-				found  = 1;		
-				break;
-			}
-		}
-	}
-
-	for(j=r_y0;j<r_y1;++j) {
-		for(i=r_x0;i<r_x1;++i) {
-			unsigned short	tbi = image_p[j*padded_width + i]; 
-
-			unsigned short        R5 = (tbi >> 11); 
-			unsigned short       G5 = ((tbi >> 6) & 0x1f);
-			unsigned short         B5 = tbi & 0x1f;
-
-			tbi = (B5 << 10) | (G5 << 5) | R5;
-			offset = j*padded_width + i;
-			if (info.transform == 2)
-				offset = (-j+info.height-1)*padded_width + (-i +padded_width-1);
-			
-			if (info.transform == 3)
-				offset = i*info.height + info.height-1-j; 
-			;
-			buffer_p[offset] = tbi;
-		}
-	}
+	/* Calculate update rectangle for VNC */
 	ur_x0 = r_x0;
 	ur_y0 = r_y0;
 	ur_x1 = r_x1;
 	ur_y1 = r_y1;
 
-	if (info.transform == 2) {
-
-	ur_x0 = -r_x0 + padded_width;
-	ur_x1 = -r_x1 + padded_width;
-	ur_y0 = -r_y0 + info.height;
-	ur_y1 = -r_y1 + info.height;
-	if (ur_x0 > ur_x1) {
-		i = ur_x1;
-		ur_x1 = ur_x0;
-		ur_x0 = i;
-	}
-	if (ur_y0 > ur_y1) {
-		i = ur_y1;
-		ur_y1 = ur_y0;
-		ur_y0 = i;
-	}
-
+	if (transform_type == 2) {
+		ur_x0 = -r_x0 + padded_width;
+		ur_x1 = -r_x1 + padded_width;
+		ur_y0 = -r_y0 + height;
+		ur_y1 = -r_y1 + height;
+		if (ur_x0 > ur_x1) {
+			i = ur_x1;
+			ur_x1 = ur_x0;
+			ur_x0 = i;
+		}
+		if (ur_y0 > ur_y1) {
+			i = ur_y1;
+			ur_y1 = ur_y0;
+			ur_y0 = i;
+		}
 	}
 
-	if (info.transform == 3) {
-		ur_x0 = -r_y0 + info.height -1;
-		ur_x1 = -r_y1 + info.height -1;
+	if (transform_type == 3) {
+		ur_x0 = -r_y0 + height - 1;
+		ur_x1 = -r_y1 + height - 1;
 		if (ur_x0 > ur_x1) {
 			i = ur_x1;
 			ur_x1 = ur_x0;
@@ -224,9 +274,8 @@ int TakePicture(unsigned char *buffer)
 	* client, the more updates it will get, the smoother it will look!
 	*/
 	gettimeofday(&now,NULL);
-	line = now.tv_usec / (1000000/info.height);
-	if (line>info.height) line=info.height-1;
-	//memset(&buffer[(info.width * BPP) * line], 0, (info.width * BPP));
+	line = now.tv_usec / (1000000/height);
+	if (line>height) line=height-1;
 	/* frames per second (informational only) */
 	fcount++;
 	if (last_line > line) {
@@ -234,9 +283,6 @@ int TakePicture(unsigned char *buffer)
 		fcount = 0;
 	}
 	last_line = line;
-	//fprintf(stderr,"%03d/%03d Picture (%03d fps) ", line, info.height, fps);
-
-	//fprintf(stderr, "x0=%d, y0=%d, x1=%d, y1=%d              \r", r_x0, r_y0, r_x1, r_y1); 
 	/* success!   We have a new picture! */
 	return (1==1);
 }
